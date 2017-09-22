@@ -1,139 +1,123 @@
-
 package tweets
 
-import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.{Sink, Source}
 import org.reactivestreams.Publisher
 import org.springframework.boot.autoconfigure.SpringBootApplication
-import org.springframework.boot.{ApplicationArguments, ApplicationRunner, SpringApplication}
+import org.springframework.boot.{ApplicationRunner, SpringApplication}
 import org.springframework.context.annotation.{Bean, Configuration}
 import org.springframework.data.annotation.Id
 import org.springframework.data.mongodb.core.mapping.Document
 import org.springframework.data.mongodb.repository.ReactiveMongoRepository
-import org.springframework.stereotype.{Component, Service}
+import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.server.RequestPredicates._
-import org.springframework.web.reactive.function.server.RouterFunction
-import org.springframework.web.reactive.function.server.RouterFunctions.route
+import org.springframework.web.reactive.function.server.RouterFunctions._
 import org.springframework.web.reactive.function.server.ServerResponse._
 import reactor.core.publisher.Flux
 
 import scala.beans.BeanProperty
 import scala.collection.JavaConverters
 
-/**
-  * This example borrows from the Akka Streams documentation.
-  *
-  * @author <a href="josh@joshlong.com">Josh Long</a>
-  */
 @SpringBootApplication
-class Application
+class Application {
 
-object Application extends App {
-  SpringApplication.run(classOf[Application], args: _*)
+  @Bean
+  def init(tr: TweetRepository): ApplicationRunner = args => {
+    val viktor = Author("viktorklang")
+    val jonas = Author("jboner")
+    val josh = Author("starbuxman")
+    val tweets = Flux.just(
+      Tweet("Woot, Konrad will be talking about #Enterprise #Integration done right! #akka #alpakka", viktor),
+      Tweet("#scala implicits can easily be used to model Capabilities, but can they encode Obligations easily?\n\n* Easy as in: ergonomically.", viktor),
+      Tweet("This is so cool! #akka", viktor),
+      Tweet("Cross Data Center replication of Event Sourced #Akka Actors is soon available (using #CRDTs, and more).", jonas),
+      Tweet("a reminder: @SpringBoot lets you pair-program with the #Spring team.", josh),
+      Tweet("whatever your next #platform is, don't build it yourself. \n\nEven companies with the $$ and motivation to do it fail. a LOT.", josh)
+    )
+    tr
+      .deleteAll()
+      .thenMany(tr.saveAll(tweets))
+      .thenMany(tr.findAll())
+      .subscribe((t: Tweet) => println(
+        s"""=====================================================
+           |@${t.author.handle} ${t.hashtags}
+           |${t.text}
+         """.stripMargin
+      ))
+  }
 }
 
 @Configuration
 class AkkaConfiguration {
 
-  @Bean
-  def actorSystem(): ActorSystem = ActorSystem.create("bootifulScala")
+  @Bean def actorSystem() = ActorSystem.create("bootifulScala")
 
-  @Bean
-  def materializer(actorSystem: ActorSystem): ActorMaterializer = ActorMaterializer.create(actorSystem)
+  @Bean def actorMaterializer() = ActorMaterializer.create(this.actorSystem())
 }
 
 @Service
-class TweetService(tweetRepository: TweetRepository, materializer: ActorMaterializer) {
+class TweetService(tr: TweetRepository, am: ActorMaterializer) {
 
-  def tweets(): Publisher[Tweet] = tweetRepository.findAll()
+  def tweets(): Publisher[Tweet] = tr.findAll()
 
-  def uniqueHashTags(): Publisher[HashTag] = {
-    val src: Source[Tweet, NotUsed] = Source.fromPublisher(tweetRepository.findAll())
-    val akkaStreamsPublisher =
-      src
-        .map(a => JavaConverters.asScalaSet(a.hashtags).toSet) // Get all sets of hashtags ...
-        .reduce((a, b) => a ++ b) // ... and reduce them to a single set, removing duplicates across all tweets
-        .mapConcat(identity) // Flatten the stream of tweets to a stream of hashtags
-        .map(x => x.name.toLowerCase()) // Convert all hashtags to upper case
-        .map(x => HashTag(x)) // convert them to a HashTag
-        .runWith(Sink.asPublisher(true)) { // finally convert the whole thing into a Reactive Streams publisher
-        materializer
+  def hashtags(): Publisher[HashTag] =
+    Source
+      .fromPublisher(tweets())
+      .map(t => JavaConverters.asScalaSet(t.hashtags).toSet)
+      .reduce((a, b) => a ++ b)
+      .mapConcat(identity)
+      .runWith(Sink.asPublisher(true)) {
+        am
       }
-    Flux.from(akkaStreamsPublisher)
-  }
 }
 
 @Configuration
-class WebConfiguration(tweetService: TweetService) {
+class TweetRouteConfiguration(tweetService: TweetService) {
 
   @Bean
-  def routes(): RouterFunction[_] =
-    route(GET("/tweets"), request => ok().body(tweetService.tweets(), classOf[Tweet]))
-      .andRoute(GET("/tweets/{id}"), request => ok().body(tweetService.uniqueHashTags(), classOf[HashTag]))
+  def routes() =
+    route(GET("/tweets"), _ => ok().body(tweetService.tweets(), classOf[Tweet]))
+      .andRoute(GET("/hashtags/unique"), _ => ok().body(tweetService.hashtags(), classOf[HashTag]))
 
 }
 
-/*@RestController
-@RequestMapping(path = Array("/tweets"), produces = Array(MediaType.APPLICATION_JSON_UTF8_VALUE))
-class TweetRestController(tweetService: TweetService) {
+/*
+@RestController
+class TweetRestController(ts: TweetService) {
 
-  @GetMapping
-  def tweets: Publisher[Tweet] = tweetService.tweets()
+  @GetMapping(Array("/hashtags/unique"))
+  def hashtags(): Publisher[HashTag] = ts.hashtags()
 
-  @GetMapping(Array("/unique-hashtags"))
-  def uniqueHashTags(): Publisher[HashTag] = tweetService.uniqueHashTags()
-}*/
-
-@Component
-class TweetInitializer(tweetRepository: TweetRepository) extends ApplicationRunner {
-
-  override def run(applicationArguments: ApplicationArguments): Unit = {
-
-    val a = Author("usera")
-    val b = Author("userb")
-    val c = Author("userc")
-
-    val tweets: Flux[Tweet] = Flux.just(
-      Tweet(a, "i <3 #akka"),
-      Tweet(b, "I <3 #spring"),
-      Tweet(c, "I <3 #spring and #akka"),
-      Tweet(b, "I dig #scala"),
-      Tweet(a, "I dig #boot"),
-      Tweet(a, "I use #boot and #scala together"))
-      .flatMap(tweetRepository.save(_))
-
-    tweetRepository
-      .deleteAll()
-      .thenMany(tweets)
-      .thenMany(tweetRepository.findAll())
-      .subscribe((it: Tweet) => println(
-        s"""
-            $it has the following hashtags: ${it.hashtags}
-          """.trim)
-      )
-  }
+  @GetMapping(Array("/tweets"))
+  def tweets(): Publisher[Tweet] = ts.tweets()
 }
+*/
+
+object Application extends App {
+  SpringApplication.run(classOf[Application], args: _*)
+}
+
 
 trait TweetRepository extends ReactiveMongoRepository[Tweet, String]
 
 @Document
-case class Author(@Id @BeanProperty handle: String)
+case class Author(@BeanProperty @Id handle: String)
 
 @Document
-case class HashTag(@Id @BeanProperty name: String)
+case class HashTag(@BeanProperty @Id tag: String)
 
 @Document
-case class Tweet(@BeanProperty author: Author, @BeanProperty body: String) {
+case class Tweet(@BeanProperty @Id text: String, @BeanProperty author: Author) {
 
   @BeanProperty
-  val hashtags: java.util.Set[HashTag] = JavaConverters.setAsJavaSet(
-    body
+  var hashtags: java.util.Set[HashTag] = JavaConverters.setAsJavaSet(
+    text
       .split(" ")
       .collect {
-        case t if t.startsWith("#") => HashTag(t.replaceAll("[^#\\w]", ""))
+        case t if t.startsWith("#") => HashTag(t.replaceAll("[^#\\w]", "").toLowerCase())
       }
       .toSet
   )
+
 }
